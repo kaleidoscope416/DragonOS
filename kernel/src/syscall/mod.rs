@@ -840,7 +840,13 @@ impl Syscall {
                 log::warn!("SYS_RT_SIGTIMEDWAIT has not yet been implemented");
                 Ok(0)
             }
+            2333 => {
+                // 2333是一个特殊的系统调用，用于测试
+                log::info!("syscall 2333 called");
+                Ok(6666)
+            }
             _ => panic!("Unsupported syscall ID: {}", syscall_num),
+
         };
 
         return r;
