@@ -477,6 +477,7 @@ dependencies = [
  "device-output-buffer",
  "driver_base_macros",
  "elf",
+ "erofs-sys",
  "fdt",
  "hashbrown 0.13.2",
  "ida",
@@ -560,6 +561,10 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "erofs-sys"
+version = "0.1.0"
 
 [[package]]
 name = "errno"

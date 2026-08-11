@@ -1,0 +1,238 @@
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
+use core::any::Any;
+use core::fmt::Debug;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use linkme::distributed_slice;
+
+use erofs_sys::data::backends::uncompressed::UncompressedBackend;
+use erofs_sys::data::{Backend, FileBackend};
+use erofs_sys::file::ImageFileSystem;
+use erofs_sys::inode::InodeInfo;
+use erofs_sys::superblock::FileSystem as ErofsFs;
+use erofs_sys::{Nid, PosixResult};
+use system_error::SystemError;
+
+use crate::driver::base::block::block_device::BlockDevice;
+use crate::driver::base::block::gendisk::GenDisk;
+use crate::filesystem::vfs::mount::MountFlags;
+use crate::filesystem::vfs::vcore::generate_inode_id;
+use crate::filesystem::vfs::{
+    FileSystem, FileSystemMakerData, FsInfo, FsReconfigureRequest, IndexNode, InodeId,
+    MountableFileSystem, SuperBlock,
+};
+use crate::libs::rwlock::RwLock;
+
+use super::errno::from_erofs_errno;
+use super::inode::{ErofsInode, ErofsSysInode};
+use super::source::BlockDevSource;
+
+/// EROFS magic number (v1, little-endian).
+const EROFS_MAGIC_V1: u64 = 0xE0F5;
+
+/// Wrapper: makes `UncompressedBackend<BlockDevSource>` implement `FileBackend`.
+pub(crate) struct BlockDevBackend(UncompressedBackend<BlockDevSource>);
+
+impl Backend for BlockDevBackend {
+    fn fill(&self, data: &mut [u8], device_id: i32, offset: erofs_sys::Off) -> PosixResult<u64> {
+        self.0.fill(data, device_id, offset)
+    }
+}
+impl FileBackend for BlockDevBackend {}
+
+/// The mounted EROFS filesystem instance.
+pub struct ErofsFileSystem {
+    pub inner: ImageFileSystem<BlockDevBackend>,
+    pub root_inode: Arc<ErofsInode>,
+    /// Nid → (InodeId, weak ErofsInode) cache.
+    pub inode_cache: RwLock<BTreeMap<Nid, (InodeId, Weak<ErofsInode>)>>,
+    #[allow(dead_code)]
+    blk_dev: Arc<dyn BlockDevice>,
+    next_ino: AtomicUsize,
+}
+
+impl Debug for ErofsFileSystem {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ErofsFileSystem")
+            .field("root_nid", &as_erofs_fs(&self.inner).superblock().root_nid)
+            .finish()
+    }
+}
+
+/// Helper: obtain an `&dyn ErofsFs<ErofsSysInode>` from the inner filesystem.
+fn as_erofs_fs(inner: &ImageFileSystem<BlockDevBackend>) -> &dyn ErofsFs<ErofsSysInode> {
+    inner.as_filesystem()
+}
+
+impl ErofsFileSystem {
+    pub fn get_or_create_inode(self: &Arc<Self>, nid: Nid) -> Result<Arc<ErofsInode>, SystemError> {
+        {
+            let cache = self.inode_cache.read();
+            if let Some((_, weak)) = cache.get(&nid) {
+                if let Some(existing) = weak.upgrade() {
+                    return Ok(existing);
+                }
+            }
+        }
+        let info = InodeInfo::try_from((as_erofs_fs(&self.inner), nid))
+            .map_err(|e| from_erofs_errno(e))?;
+
+        let ino = InodeId::new(self.next_ino.fetch_add(1, Ordering::Relaxed));
+        let inode = Arc::new(ErofsInode {
+            info,
+            ino,
+            nid,
+            fs: Arc::downgrade(self),
+        });
+
+        let mut cache = self.inode_cache.write();
+        if let Some((_, existing_weak)) = cache.get(&nid) {
+            if let Some(existing) = existing_weak.upgrade() {
+                return Ok(existing);
+            }
+        }
+        cache.insert(nid, (ino, Arc::downgrade(&inode)));
+        Ok(inode)
+    }
+
+    pub fn nid_to_ino(&self, nid: Nid) -> InodeId {
+        let cache = self.inode_cache.read();
+        if let Some((ino, _)) = cache.get(&nid) {
+            return *ino;
+        }
+        InodeId::new(self.next_ino.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl FileSystem for ErofsFileSystem {
+    fn root_inode(&self) -> Arc<dyn IndexNode> {
+        self.root_inode.clone()
+    }
+
+    fn info(&self) -> FsInfo {
+        FsInfo {
+            blk_dev_id: 0,
+            max_name_len: 255,
+        }
+    }
+
+    fn name(&self) -> &str {
+        "erofs"
+    }
+
+    fn super_block(&self) -> SuperBlock {
+        let sb = as_erofs_fs(&self.inner).superblock();
+        SuperBlock {
+            magic: crate::filesystem::vfs::Magic::from_bits_truncate(EROFS_MAGIC_V1),
+            bsize: sb.blksz(),
+            blocks: sb.blocks() as u64,
+            bfree: 0,
+            bavail: 0,
+            files: sb.inos() as u64,
+            ffree: 0,
+            fsid: 0,
+            namelen: 255,
+            frsize: sb.blksz(),
+            flags: 0,
+        }
+    }
+
+    fn support_readahead(&self) -> bool {
+        false
+    }
+
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn sync_fs(&self, _wait: bool) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn reconfigure(&self, request: FsReconfigureRequest<'_>) -> Result<MountFlags, SystemError> {
+        if request.raw_data.is_some_and(|raw| !raw.trim().is_empty()) {
+            return Err(SystemError::EINVAL);
+        }
+        Ok(request.sb_flags & request.sb_flags_mask)
+    }
+}
+
+// --- MountableFileSystem ---
+
+struct ErofsMountData {
+    source: String,
+}
+
+impl FileSystemMakerData for ErofsMountData {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl MountableFileSystem for ErofsFileSystem {
+    fn make_mount_data(
+        _raw_data: Option<&str>,
+        source: &str,
+    ) -> Result<Option<Arc<dyn FileSystemMakerData + 'static>>, SystemError> {
+        Ok(Some(Arc::new(ErofsMountData {
+            source: source.to_string(),
+        })))
+    }
+
+    fn make_fs_with_flags(
+        data: Option<&dyn FileSystemMakerData>,
+        _mount_flags: MountFlags,
+    ) -> Result<Arc<dyn FileSystem + 'static>, SystemError> {
+        let md = data.ok_or(SystemError::EINVAL)?;
+        let md = md
+            .as_any()
+            .downcast_ref::<ErofsMountData>()
+            .ok_or(SystemError::EINVAL)?;
+
+        let gen_disk: Arc<GenDisk> = crate::filesystem::vfs::vcore::try_find_gendisk(&md.source)
+            .ok_or(SystemError::ENODEV)?;
+        let blk_dev: Arc<dyn BlockDevice> =
+            gen_disk.block_device().map_err(|_| SystemError::ENODEV)?;
+        let _mount_guard = gen_disk.acquire_mount_holder().map_err(|e| {
+            log::error!("erofs: failed to acquire mount holder: {:?}", e);
+            SystemError::EBUSY
+        })?;
+
+        let source = BlockDevSource::new(blk_dev.clone());
+        let backend = BlockDevBackend(UncompressedBackend::new(source));
+        let inner: ImageFileSystem<BlockDevBackend> =
+            ImageFileSystem::try_new(backend).map_err(|e| from_erofs_errno(e))?;
+
+        let root_nid = as_erofs_fs(&inner).superblock().root_nid as Nid;
+        let root_info = InodeInfo::try_from((as_erofs_fs(&inner), root_nid))
+            .map_err(|e| from_erofs_errno(e))?;
+
+        let fs: Arc<ErofsFileSystem> = Arc::new_cyclic(|weak_fs| {
+            let root_ino = generate_inode_id();
+            let root_inode = Arc::new(ErofsInode {
+                info: root_info,
+                ino: root_ino,
+                nid: root_nid,
+                fs: weak_fs.clone(),
+            });
+            let mut cache = BTreeMap::new();
+            cache.insert(root_nid, (root_ino, Arc::downgrade(&root_inode)));
+            ErofsFileSystem {
+                inner,
+                root_inode,
+                inode_cache: RwLock::new(cache),
+                blk_dev,
+                next_ino: AtomicUsize::new(root_ino.data() + 1),
+            }
+        });
+
+        core::mem::forget(_mount_guard);
+
+        Ok(fs)
+    }
+}
+
+use crate::filesystem::vfs::FSMAKER;
+use crate::register_mountable_fs;
+register_mountable_fs!(ErofsFileSystem, EROFSMAKER, "erofs");

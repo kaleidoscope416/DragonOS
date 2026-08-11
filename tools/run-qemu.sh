@@ -121,11 +121,13 @@ RISCV64_UBOOT_PATH="arch/riscv64/u-boot-${UBOOT_VERSION}-riscv64"
 DISK_NAME="disk-image-${ARCH}.img"
 EXT4_DISK_NAME="ext4.img"
 FAT_DISK_NAME="fat.img"
+EROFS_DISK_NAME="erofs.img"
 
 QEMU=$(which qemu-system-${ARCH})
 QEMU_DISK_IMAGE="${DRAGONOS_QEMU_DISK_IMAGE:-../bin/${DISK_NAME}}"
 QEMU_EXT4_DISK_IMAGE="../bin/${EXT4_DISK_NAME}"
 QEMU_FAT_DISK_IMAGE="../bin/${FAT_DISK_NAME}"
+QEMU_EROFS_DISK_IMAGE="../bin/${EROFS_DISK_NAME}"
 QEMU_MEMORY="2G"
 PMEM_IMAGE_PATH="${PMEM_IMAGE_PATH:-}"
 PMEM_SIZE="${PMEM_SIZE:-}"
@@ -467,6 +469,10 @@ fi
 if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
   QEMU_DRIVE_ARGS+=(-drive "id=fatdisk,file=${QEMU_FAT_DISK_IMAGE},if=none,format=raw")
 fi
+if [ -f "${QEMU_EROFS_DISK_IMAGE}" ]; then
+  QEMU_DRIVE_ARGS+=(-drive "id=erofsdisk,file=${QEMU_EROFS_DISK_IMAGE},if=none,format=raw")
+fi
+
 
 check_dependencies
 
@@ -531,6 +537,9 @@ if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
     fi
     if [ -f "${QEMU_FAT_DISK_IMAGE}" ]; then
       QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=fatdisk)
+    fi
+    if [ -f "${QEMU_EROFS_DISK_IMAGE}" ]; then
+      QEMU_DEVICE_DISK_ARGS+=(-device virtio-blk-pci,drive=erofsdisk)
     fi
 
     # 默认启用 vsock；若宿主环境不满足条件则降级为跳过该设备。

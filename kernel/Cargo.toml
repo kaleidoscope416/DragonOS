@@ -91,6 +91,7 @@ slabmalloc = { path = "crates/rust-slabmalloc" }
 log = "0.4.21"
 kprobe = { path = "crates/kprobe" }
 lru = "0.12.3"
+erofs-sys = { path = "../../erofs-rs/erofs-sys" }
 
 rbpf = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/rbpf", rev = "f31e471a29", default-features = false }
 printf-compat = { version = "=0.3.1", default-features = false }
