@@ -1,10 +1,10 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use erofs_sys::inode::{Inode, InodeInfo, Type};
-use erofs_sys::superblock::FileSystem as ErofsFs;
-use erofs_sys::xattrs::XAttrSharedEntries;
-use erofs_sys::Nid;
+use kdepends::erofs_sys::inode::{Inode, InodeInfo, Type};
+use kdepends::erofs_sys::superblock::FileSystem as ErofsFs;
+use kdepends::erofs_sys::xattrs::XAttrSharedEntries;
+use kdepends::erofs_sys::Nid;
 use system_error::SystemError;
 
 use crate::filesystem::vfs::file::FileFlags;
@@ -27,7 +27,7 @@ pub(crate) struct ErofsSysInode {
 
 impl Inode for ErofsSysInode {
     fn new(
-        _sb: &erofs_sys::superblock::SuperBlock,
+        _sb: &kdepends::erofs_sys::superblock::SuperBlock,
         info: InodeInfo,
         nid: Nid,
         xattrs_shared_entries: XAttrSharedEntries,

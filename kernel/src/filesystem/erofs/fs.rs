@@ -6,12 +6,12 @@ use core::fmt::Debug;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use linkme::distributed_slice;
 
-use erofs_sys::data::backends::uncompressed::UncompressedBackend;
-use erofs_sys::data::{Backend, FileBackend};
-use erofs_sys::file::ImageFileSystem;
-use erofs_sys::inode::InodeInfo;
-use erofs_sys::superblock::FileSystem as ErofsFs;
-use erofs_sys::{Nid, PosixResult};
+use kdepends::erofs_sys::data::backends::uncompressed::UncompressedBackend;
+use kdepends::erofs_sys::data::{Backend, FileBackend};
+use kdepends::erofs_sys::file::ImageFileSystem;
+use kdepends::erofs_sys::inode::InodeInfo;
+use kdepends::erofs_sys::superblock::FileSystem as ErofsFs;
+use kdepends::erofs_sys::{Nid, PosixResult};
 use system_error::SystemError;
 
 use crate::driver::base::block::block_device::BlockDevice;
@@ -49,7 +49,7 @@ struct ErofsSuperProbe {
 fn probe_erofs_superblock(backend: &BlockDevBackend) -> Result<ErofsSuperProbe, SystemError> {
     let mut sb = [0u8; 128];
     let n = backend
-        .fill(&mut sb, 0, EROFS_SUPER_OFFSET as erofs_sys::Off)
+        .fill(&mut sb, 0, EROFS_SUPER_OFFSET as kdepends::erofs_sys::Off)
         .map_err(|e| from_erofs_errno(e))?;
     if n < 128 {
         return Err(SystemError::EUCLEAN);
@@ -65,7 +65,7 @@ fn probe_erofs_superblock(backend: &BlockDevBackend) -> Result<ErofsSuperProbe, 
 pub(crate) struct BlockDevBackend(UncompressedBackend<BlockDevSource>);
 
 impl Backend for BlockDevBackend {
-    fn fill(&self, data: &mut [u8], device_id: i32, offset: erofs_sys::Off) -> PosixResult<u64> {
+    fn fill(&self, data: &mut [u8], device_id: i32, offset: kdepends::erofs_sys::Off) -> PosixResult<u64> {
         self.0.fill(data, device_id, offset)
     }
 }

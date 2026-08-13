@@ -477,7 +477,6 @@ dependencies = [
  "device-output-buffer",
  "driver_base_macros",
  "elf",
- "erofs-sys",
  "fdt",
  "hashbrown 0.13.2",
  "ida",
@@ -834,6 +833,7 @@ version = "0.1.0"
 dependencies = [
  "another_ext4",
  "crc",
+ "erofs-sys",
  "memoffset",
  "ringbuffer",
  "thingbuf",
