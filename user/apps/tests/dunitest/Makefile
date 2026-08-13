@@ -20,6 +20,8 @@ RESULTS_DIR = results
 BIN_DIR = bin
 BUILD_DIR = build
 EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
+EROFS_FIXTURE = $(BUILD_DIR)/fixtures/erofs_basic.img
+EROFS_FIXTURE_ROOT = $(BUILD_DIR)/fixtures/erofs_root
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -58,7 +60,7 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EROFS_FIXTURE)
 
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -72,6 +74,20 @@ $(EXT4_FIXTURE):
 			*) printf '%s\n' "$$output" >&2; exit 1 ;; \
 		esac; \
 	}
+
+# EROFS fixtures：供 erofs_basic 测例使用（需要 erofs-utils）
+$(EROFS_FIXTURE_ROOT):
+	@mkdir -p "$@" "$@/subdir" "$@/frag"
+	@printf 'hello from erofs!\n' > "$@/hello.txt"
+	@printf 'nested file content\n' > "$@/subdir/nested.txt"
+	@printf 'symlink target data\n' > "$@/target.txt"
+	@ln -sf target.txt "$@/symlink"
+	@python3 -c 'import sys; r=0x12345678; sys.stdout.buffer.write(bytes(((r:=r*1103515245+12345)&0xffff)>>8 for _ in range(5120)))' > "$@/frag/rand.bin"
+
+$(EROFS_FIXTURE): $(EROFS_FIXTURE_ROOT)
+	@mkdir -p "$(dir $@)"
+	@mkfs.erofs "$@" "$(EROFS_FIXTURE_ROOT)" 2>/dev/null || { echo "错误: mkfs.erofs 不可用，无法生成 EROFS fixture（需要 erofs-utils）" >&2; exit 1; }
+
 
 $(GTEST_OBJ): $(GTEST_SRC)
 	@mkdir -p "$(dir $@)"
@@ -100,6 +116,7 @@ install: build
 	@cp -rf $(BIN_DIR) $(INSTALL_DIR)/
 	@mkdir -p $(INSTALL_DIR)/fixtures
 	@cp --sparse=always -f $(EXT4_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp -f $(EROFS_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

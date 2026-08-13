@@ -1993,6 +1993,7 @@ bitflags! {
         // Linux UAPI: MSDOS_SUPER_MAGIC.
         const FAT_MAGIC = 0x4d44;
         const EXT4_MAGIC = 0xef53;
+        const EROFS_MAGIC = 0xe0f5e1e2;
         const FUSE_MAGIC = 0x65735546;
         const TMPFS_MAGIC = 0x01021994;
         const KER_MAGIC = 0x3153464b;
