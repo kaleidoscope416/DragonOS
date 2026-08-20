@@ -1,4 +1,3 @@
-use alloc::string::String;
 use alloc::sync::Arc;
 use kdepends::erofs_sys::data::Source;
 use kdepends::erofs_sys::{Off, PosixResult};

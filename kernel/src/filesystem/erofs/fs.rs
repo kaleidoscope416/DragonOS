@@ -15,8 +15,9 @@ use kdepends::erofs_sys::{Nid, PosixResult};
 use system_error::SystemError;
 
 use crate::driver::base::block::block_device::BlockDevice;
-use crate::driver::base::block::gendisk::GenDisk;
+use crate::driver::base::block::gendisk::{GenDisk, GenDiskMountGuard};
 use crate::filesystem::vfs::mount::MountFlags;
+use crate::mm::MemoryManagementArch;
 use crate::filesystem::vfs::vcore::generate_inode_id;
 use crate::filesystem::vfs::{
     FileSystem, FileSystemMakerData, FsInfo, FsReconfigureRequest, IndexNode, InodeId,
@@ -37,15 +38,26 @@ const EROFS_MAGIC_V1: u32 = 0xE0F5_E1E2;
 /// 挂载前对原始 superblock 的格式预检结果。
 struct ErofsSuperProbe {
     magic: u32,
+    /// `blkszbits`：块大小 = `1 << blkszbits`。Linux 要求 9..=PAGE_SHIFT。
+    blkszbits: u8,
     /// `available_compr_algs`：非 0 表示镜像带压缩（阶段一不支持）。
     compression: i16,
     /// `extra_devices`：非 0 表示多设备镜像（阶段一不支持）。
     extra_devices: i16,
+    /// `feature_incompat`：阶段一仅接受 ZERO_PADDING（0x1，纯信息位），
+    /// 其余（ZSTD/设备表/大 pcluster/chunk/去重等）一律拒绝。
+    feature_incompat: u32,
 }
 
+/// EROFS `feature_incompat` 中阶段一唯一接受的位：镜像尾部零填充，不影响读取语义。
+const EROFS_FEATURE_INCOMPAT_ZERO_PADDING: u32 = 0x1;
+
+/// EROFS 最小合法块大小（512B，`blkszbits == 9`）。
+const EROFS_MIN_BLKSZBITS: u8 = 9;
+
 /// 读取并解析 superblock 关键字段。erofs-sys 的 `try_new` 不做 magic /
-/// 压缩 / 多设备校验，缺失时压缩镜像会在读路径触发 `todo!()` panic，
-/// 多设备镜像会把非 0 设备号的块误读成本设备数据，因此必须在挂载时明确拒绝。
+/// 压缩 / 多设备 / 块大小校验，缺失时坏镜像会在读路径触发 panic、
+/// 读错数据或 OOB，因此必须在挂载时明确拒绝。
 fn probe_erofs_superblock(backend: &BlockDevBackend) -> Result<ErofsSuperProbe, SystemError> {
     let mut sb = [0u8; 128];
     let n = backend
@@ -56,8 +68,10 @@ fn probe_erofs_superblock(backend: &BlockDevBackend) -> Result<ErofsSuperProbe, 
     }
     Ok(ErofsSuperProbe {
         magic: u32::from_le_bytes(sb[0..4].try_into().unwrap()),
+        blkszbits: sb[12],
         compression: i16::from_le_bytes(sb[84..86].try_into().unwrap()),
         extra_devices: i16::from_le_bytes(sb[86..88].try_into().unwrap()),
+        feature_incompat: u32::from_le_bytes(sb[80..84].try_into().unwrap()),
     })
 }
 
@@ -79,6 +93,9 @@ pub struct ErofsFileSystem {
     pub inode_cache: RwLock<BTreeMap<Nid, (InodeId, Weak<ErofsInode>)>>,
     #[allow(dead_code)]
     blk_dev: Arc<dyn BlockDevice>,
+    /// Prevents loop clear/remove for the complete filesystem lifetime.
+    #[allow(dead_code)]
+    _mount_holder: GenDiskMountGuard,
     next_ino: AtomicUsize,
 }
 
@@ -107,31 +124,47 @@ impl ErofsFileSystem {
         }
         let info = InodeInfo::try_from((as_erofs_fs(&self.inner), nid))
             .map_err(|e| from_erofs_errno(e))?;
-
-        let ino = InodeId::new(self.next_ino.fetch_add(1, Ordering::Relaxed));
+        let mut cache = self.inode_cache.write();
+        // 双检：并发下可能有其他线程抢先创建。若缓存条目仍存在但 inode
+        // 已释放（如 readdir 经 nid_to_ino 预分配过 ino），复用其 ino，
+        // 保证 d_ino == st_ino。
+        let ino = match cache.get(&nid) {
+            Some((cached_ino, existing_weak)) => {
+                if let Some(existing) = existing_weak.upgrade() {
+                    return Ok(existing);
+                }
+                *cached_ino
+            }
+            None => InodeId::new(self.next_ino.fetch_add(1, Ordering::Relaxed)),
+        };
         let inode = Arc::new(ErofsInode {
             info,
             ino,
             nid,
             fs: Arc::downgrade(self),
         });
-
-        let mut cache = self.inode_cache.write();
-        if let Some((_, existing_weak)) = cache.get(&nid) {
-            if let Some(existing) = existing_weak.upgrade() {
-                return Ok(existing);
-            }
-        }
         cache.insert(nid, (ino, Arc::downgrade(&inode)));
         Ok(inode)
     }
 
+    /// nid → ino 映射。未命中时分配并回填缓存（以空 weak 占位），
+    /// 保证同一 nid 在 readdir/stat 间 ino 稳定一致。
     pub fn nid_to_ino(&self, nid: Nid) -> InodeId {
-        let cache = self.inode_cache.read();
-        if let Some((ino, _)) = cache.get(&nid) {
-            return *ino;
+        {
+            let cache = self.inode_cache.read();
+            if let Some((ino, _)) = cache.get(&nid) {
+                return *ino;
+            }
         }
-        InodeId::new(self.next_ino.fetch_add(1, Ordering::Relaxed))
+        let ino = InodeId::new(self.next_ino.fetch_add(1, Ordering::Relaxed));
+        let mut cache = self.inode_cache.write();
+        match cache.get(&nid) {
+            Some((existing_ino, _)) => *existing_ino,
+            None => {
+                cache.insert(nid, (ino, Weak::new()));
+                ino
+            }
+        }
     }
 }
 
@@ -224,7 +257,7 @@ impl MountableFileSystem for ErofsFileSystem {
             .ok_or(SystemError::ENODEV)?;
         let blk_dev: Arc<dyn BlockDevice> =
             gen_disk.block_device().map_err(|_| SystemError::ENODEV)?;
-        let _mount_guard = gen_disk.acquire_mount_holder().map_err(|e| {
+        let mount_holder = gen_disk.acquire_mount_holder().map_err(|e| {
             log::error!("erofs: failed to acquire mount holder: {:?}", e);
             SystemError::EBUSY
         })?;
@@ -232,10 +265,22 @@ impl MountableFileSystem for ErofsFileSystem {
         let source = BlockDevSource::new(blk_dev.clone());
         let backend = BlockDevBackend(UncompressedBackend::new(source));
 
-        // 格式预检：非 EROFS / 压缩 / 多设备镜像一律拒绝，避免读路径 panic 或读错数据。
+        // 格式预检：非 EROFS / 压缩 / 多设备 / 非法块大小 / 不支持的
+        // feature_incompat 位一律拒绝，避免读路径 panic 或读错数据。
         let probe = probe_erofs_superblock(&backend)?;
         if probe.magic != EROFS_MAGIC_V1 {
             log::warn!("erofs: bad magic {:#x} on {}, not an EROFS image", probe.magic, md.source);
+            return Err(SystemError::EUCLEAN);
+        }
+        if probe.blkszbits < EROFS_MIN_BLKSZBITS
+            || probe.blkszbits > crate::arch::MMArch::PAGE_SHIFT as u8
+        {
+            log::warn!(
+                "erofs: invalid blkszbits {} on {} (expected 9..={})",
+                probe.blkszbits,
+                md.source,
+                crate::arch::MMArch::PAGE_SHIFT
+            );
             return Err(SystemError::EUCLEAN);
         }
         if probe.compression != 0 {
@@ -251,6 +296,13 @@ impl MountableFileSystem for ErofsFileSystem {
                 probe.extra_devices, md.source
             );
             return Err(SystemError::EUCLEAN);
+        }
+        if probe.feature_incompat & !EROFS_FEATURE_INCOMPAT_ZERO_PADDING != 0 {
+            log::warn!(
+                "erofs: unsupported feature_incompat {:#x} on {} (phase 1)",
+                probe.feature_incompat, md.source
+            );
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }
 
         let inner: ImageFileSystem<BlockDevBackend> =
@@ -275,11 +327,10 @@ impl MountableFileSystem for ErofsFileSystem {
                 root_inode,
                 inode_cache: RwLock::new(cache),
                 blk_dev,
+                _mount_holder: mount_holder,
                 next_ino: AtomicUsize::new(root_ino.data() + 1),
             }
         });
-
-        core::mem::forget(_mount_guard);
 
         Ok(fs)
     }

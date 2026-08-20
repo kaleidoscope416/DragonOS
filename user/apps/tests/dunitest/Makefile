@@ -22,6 +22,10 @@ BUILD_DIR = build
 EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
 EROFS_FIXTURE = $(BUILD_DIR)/fixtures/erofs_basic.img
 EROFS_FIXTURE_ROOT = $(BUILD_DIR)/fixtures/erofs_root
+# 非法镜像：blkszbits 置 0；feature_incompat 置 ZSTD(0x2)。
+# 挂载必须被内核拒绝，不能进入读路径。
+EROFS_FIXTURE_BAD_BLKSZ = $(BUILD_DIR)/fixtures/erofs_bad_blkszbits.img
+EROFS_FIXTURE_BAD_INCOMPAT = $(BUILD_DIR)/fixtures/erofs_bad_incompat.img
 
 # 要编译的测试套件目录列表（suites/ 下的子目录名）
 SUITES = demo normal fuse
@@ -60,7 +64,8 @@ $(GTEST_SRC):
 	@mv "$(GTEST_TMP_ROOT)" "$(GTEST_ROOT)"
 	@test -f "$(GTEST_SRC)"
 
-build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EROFS_FIXTURE)
+build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EROFS_FIXTURE) \
+	$(EROFS_FIXTURE_BAD_BLKSZ) $(EROFS_FIXTURE_BAD_INCOMPAT)
 
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -87,6 +92,19 @@ $(EROFS_FIXTURE_ROOT):
 $(EROFS_FIXTURE): $(EROFS_FIXTURE_ROOT)
 	@mkdir -p "$(dir $@)"
 	@mkfs.erofs "$@" "$(EROFS_FIXTURE_ROOT)" 2>/dev/null || { echo "错误: mkfs.erofs 不可用，无法生成 EROFS fixture（需要 erofs-utils）" >&2; exit 1; }
+
+# blkszbits 位于 superblock 偏移 12（superblock 起点 1024）→ 文件偏移 1036。
+# 注意：make 的 shell 是 dash，不支持 \xNN 转义，须用八进制 \0NN。
+$(EROFS_FIXTURE_BAD_BLKSZ): $(EROFS_FIXTURE)
+	@mkdir -p "$(dir $@)"
+	@cp "$<" "$@"
+	@printf '\000' | dd of="$@" bs=1 seek=1036 conv=notrunc status=none
+
+# feature_incompat 位于 superblock 偏移 80..84 → 文件偏移 1104，置 ZSTD(0x2)。
+$(EROFS_FIXTURE_BAD_INCOMPAT): $(EROFS_FIXTURE)
+	@mkdir -p "$(dir $@)"
+	@cp "$<" "$@"
+	@printf '\002\000\000\000' | dd of="$@" bs=1 seek=1104 conv=notrunc status=none
 
 
 $(GTEST_OBJ): $(GTEST_SRC)
@@ -117,6 +135,8 @@ install: build
 	@mkdir -p $(INSTALL_DIR)/fixtures
 	@cp --sparse=always -f $(EXT4_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f $(EROFS_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp -f $(EROFS_FIXTURE_BAD_BLKSZ) $(INSTALL_DIR)/fixtures/
+	@cp -f $(EROFS_FIXTURE_BAD_INCOMPAT) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh

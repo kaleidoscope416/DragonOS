@@ -342,7 +342,7 @@ where
     /// Findnid
     fn find_nid(&self, inode: &I, name: &str) -> PosixResult<Option<Nid>> {
         for buf in self.mapped_iter(inode, 0)? {
-            for dirent in buf?.iter_dir() {
+            for dirent in buf?.iter_dir()? {
                 if dirent.dirname() == name.as_bytes() {
                     return Ok(Some(dirent.desc.nid));
                 }
@@ -370,8 +370,12 @@ where
         let blk_offset = round!(UP, accessor.off, size_of::<DirentDesc>() as Off);
 
         let mut map_iter = self.mapped_iter(inode, map_offset)?;
-        let first_buf = map_iter.next().unwrap()?;
-        let mut collection = first_buf.iter_dir();
+        // 空目录（file_size == 0）没有数据块，直接返回空结果。
+        let Some(first_buf) = map_iter.next() else {
+            return Ok(());
+        };
+        let first_buf = first_buf?;
+        let mut collection = first_buf.iter_dir()?;
         let mut cnt = 0;
         let mut pos: Off = map_offset + blk_offset;
 
@@ -389,7 +393,7 @@ where
         pos = round!(UP, pos, sb.blksz());
 
         for buf in map_iter {
-            for dirent in buf?.iter_dir() {
+            for dirent in buf?.iter_dir()? {
                 if cnt >= skipents && emitter(dirent, pos) {
                     return Ok(());
                 }
