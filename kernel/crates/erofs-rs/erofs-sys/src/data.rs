@@ -64,7 +64,7 @@ pub trait Buffer {
     /// get the content of internal buffer
     fn content(&self) -> &[u8];
     /// get the iterative directory
-    fn iter_dir(&self) -> DirCollection<'_> {
+    fn iter_dir(&self) -> PosixResult<DirCollection<'_>> {
         DirCollection::new(self.content())
     }
 }

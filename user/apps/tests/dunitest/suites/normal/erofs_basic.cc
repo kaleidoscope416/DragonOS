@@ -261,7 +261,48 @@ TEST_F(ErofsBasicTest, WriteFailsWithErofs) {
     close(fd);
 }
 
+
 }  // namespace
+
+TEST(ErofsMountValidation, RejectsInvalidBlkszbits) {
+    std::string fixture = FixturePath("erofs_bad_blkszbits.img");
+    ASSERT_FALSE(fixture.empty());
+    ASSERT_EQ(0, access(fixture.c_str(), R_OK))
+        << "fixture missing: erofs_bad_blkszbits.img";
+
+    std::string loop_path = AttachLoop(fixture);
+    ASSERT_FALSE(loop_path.empty());
+    std::string mount_point = "/tmp/erofs_badblk_" + std::to_string(getpid());
+    ASSERT_EQ(0, mkdir(mount_point.c_str(), 0700)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, mount(loop_path.c_str(), mount_point.c_str(), "erofs", 0, nullptr));
+    EXPECT_EQ(EUCLEAN, errno) << "unexpected errno=" << errno << " (" << strerror(errno) << ")";
+
+    rmdir(mount_point.c_str());
+    DetachLoop(loop_path);
+}
+
+TEST(ErofsMountValidation, RejectsUnsupportedFeatureIncompat) {
+    std::string fixture = FixturePath("erofs_bad_incompat.img");
+    ASSERT_FALSE(fixture.empty());
+    ASSERT_EQ(0, access(fixture.c_str(), R_OK))
+        << "fixture missing: erofs_bad_incompat.img";
+
+    std::string loop_path = AttachLoop(fixture);
+    ASSERT_FALSE(loop_path.empty());
+    std::string mount_point = "/tmp/erofs_badinc_" + std::to_string(getpid());
+    ASSERT_EQ(0, mkdir(mount_point.c_str(), 0700)) << strerror(errno);
+
+    errno = 0;
+    EXPECT_EQ(-1, mount(loop_path.c_str(), mount_point.c_str(), "erofs", 0, nullptr));
+    EXPECT_EQ(EOPNOTSUPP, errno)
+        << "unexpected errno=" << errno << " (" << strerror(errno) << ")";
+
+    rmdir(mount_point.c_str());
+    DetachLoop(loop_path);
+}
+
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
