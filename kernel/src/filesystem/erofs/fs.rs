@@ -28,8 +28,38 @@ use super::errno::from_erofs_errno;
 use super::inode::{ErofsInode, ErofsSysInode};
 use super::source::BlockDevSource;
 
-/// EROFS magic number (v1, little-endian).
-const EROFS_MAGIC_V1: u64 = 0xE0F5;
+/// EROFS v1 superblock 位于设备偏移 1024 字节处（`erofs_fs.h` 的 `erofs_super_block`）。
+const EROFS_SUPER_OFFSET: usize = 1024;
+
+/// EROFS v1 磁盘魔数（little-endian `0xE0F5E1E2`），与 `Magic::EROFS_MAGIC` 一致。
+const EROFS_MAGIC_V1: u32 = 0xE0F5_E1E2;
+
+/// 挂载前对原始 superblock 的格式预检结果。
+struct ErofsSuperProbe {
+    magic: u32,
+    /// `available_compr_algs`：非 0 表示镜像带压缩（阶段一不支持）。
+    compression: i16,
+    /// `extra_devices`：非 0 表示多设备镜像（阶段一不支持）。
+    extra_devices: i16,
+}
+
+/// 读取并解析 superblock 关键字段。erofs-sys 的 `try_new` 不做 magic /
+/// 压缩 / 多设备校验，缺失时压缩镜像会在读路径触发 `todo!()` panic，
+/// 多设备镜像会把非 0 设备号的块误读成本设备数据，因此必须在挂载时明确拒绝。
+fn probe_erofs_superblock(backend: &BlockDevBackend) -> Result<ErofsSuperProbe, SystemError> {
+    let mut sb = [0u8; 128];
+    let n = backend
+        .fill(&mut sb, 0, EROFS_SUPER_OFFSET as erofs_sys::Off)
+        .map_err(|e| from_erofs_errno(e))?;
+    if n < 128 {
+        return Err(SystemError::EUCLEAN);
+    }
+    Ok(ErofsSuperProbe {
+        magic: u32::from_le_bytes(sb[0..4].try_into().unwrap()),
+        compression: i16::from_le_bytes(sb[84..86].try_into().unwrap()),
+        extra_devices: i16::from_le_bytes(sb[86..88].try_into().unwrap()),
+    })
+}
 
 /// Wrapper: makes `UncompressedBackend<BlockDevSource>` implement `FileBackend`.
 pub(crate) struct BlockDevBackend(UncompressedBackend<BlockDevSource>);
@@ -124,7 +154,7 @@ impl FileSystem for ErofsFileSystem {
     fn super_block(&self) -> SuperBlock {
         let sb = as_erofs_fs(&self.inner).superblock();
         SuperBlock {
-            magic: crate::filesystem::vfs::Magic::from_bits_truncate(EROFS_MAGIC_V1),
+            magic: crate::filesystem::vfs::Magic::EROFS_MAGIC,
             bsize: sb.blksz(),
             blocks: sb.blocks() as u64,
             bfree: 0,
@@ -201,6 +231,28 @@ impl MountableFileSystem for ErofsFileSystem {
 
         let source = BlockDevSource::new(blk_dev.clone());
         let backend = BlockDevBackend(UncompressedBackend::new(source));
+
+        // 格式预检：非 EROFS / 压缩 / 多设备镜像一律拒绝，避免读路径 panic 或读错数据。
+        let probe = probe_erofs_superblock(&backend)?;
+        if probe.magic != EROFS_MAGIC_V1 {
+            log::warn!("erofs: bad magic {:#x} on {}, not an EROFS image", probe.magic, md.source);
+            return Err(SystemError::EUCLEAN);
+        }
+        if probe.compression != 0 {
+            log::warn!(
+                "erofs: compressed image (available_compr_algs={}) on {} not supported in phase 1",
+                probe.compression, md.source
+            );
+            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+        }
+        if probe.extra_devices != 0 {
+            log::warn!(
+                "erofs: multi-device image (extra_devices={}) on {} not supported in phase 1",
+                probe.extra_devices, md.source
+            );
+            return Err(SystemError::EUCLEAN);
+        }
+
         let inner: ImageFileSystem<BlockDevBackend> =
             ImageFileSystem::try_new(backend).map_err(|e| from_erofs_errno(e))?;
 
