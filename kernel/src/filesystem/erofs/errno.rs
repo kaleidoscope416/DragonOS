@@ -1,5 +1,5 @@
-use erofs_sys::errnos::Errno;
-use erofs_sys::errnos::Errno::*;
+use kdepends::erofs_sys::errnos::Errno;
+use kdepends::erofs_sys::errnos::Errno::*;
 use system_error::SystemError;
 
 /// Map an erofs-sys `Errno` to a DragonOS `SystemError`.

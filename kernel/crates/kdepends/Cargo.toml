@@ -12,6 +12,7 @@ memoffset = "0.9.0"
 ringbuffer = "0.15.0"
 xarray = { git = "https://git.mirrors.dragonos.org.cn/DragonOS-Community/xarray", rev = "5113ad0ea0", features = ["slab-friendly"] }
 another_ext4 = { path = "../another_ext4", default-features = false }
+erofs-sys = { path = "../erofs-rs/erofs-sys", default-features = false }
 
 # 一个无锁MPSC队列
 [dependencies.thingbuf]

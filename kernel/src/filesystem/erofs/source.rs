@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
-use erofs_sys::data::Source;
-use erofs_sys::{Off, PosixResult};
+use kdepends::erofs_sys::data::Source;
+use kdepends::erofs_sys::{Off, PosixResult};
 
 use crate::driver::base::block::block_device::{BlockDevice, LBA_SIZE};
 
@@ -27,7 +27,7 @@ impl Source for BlockDevSource {
         let read_bytes = self
             .dev
             .read_at_sync(blk, blk_count, &mut raw_buf)
-            .map_err(|_| erofs_sys::errnos::Errno::EIO)?;
+            .map_err(|_| kdepends::erofs_sys::errnos::Errno::EIO)?;
         let available = read_bytes.saturating_sub(off_in_blk);
         let copy_len = data.len().min(available);
         data[..copy_len].copy_from_slice(&raw_buf[off_in_blk..off_in_blk + copy_len]);

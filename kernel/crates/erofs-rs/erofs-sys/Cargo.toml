@@ -1,0 +1,43 @@
+[package]
+name = "erofs-sys"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yiyang Wu <toolmanp@tlmp.cc>"]
+description = "Rust core implementation of the Extended Read Only FileSystem"
+license = "MIT"
+homepage = "https://github.com/ToolmanP/erofs-rs"
+repository = "https://github.com/ToolmanP/erofs-rs"
+readme = "README.md"
+keywords = ["filesystem"]
+
+[dependencies]
+
+[dev-dependencies]
+memmap2 = "0.9.4" # For Testing the Memory Backed Filesystem.
+sha2 = "0.10.8" # For Inspecting the Hash of the filesystem data.
+hex-literal = "0.4.1" # For Hexadecimal Literals
+
+
+# The following is copyed from the rust-for-linux project Makefile
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+rust_2018_idioms = "deny"
+unreachable_pub = "deny"
+non_ascii_idents = "deny"
+missing_docs = "deny"
+
+[lints.rustdoc]
+missing_crate_level_docs = "warn"
+
+[lints.clippy]
+correctness = "deny"
+style = "deny"
+suspicious = "deny"
+complexity = "deny"
+perf = "deny"
+let_unit_value = "deny"
+mut_mut = "deny"
+needless_bitwise_bool = "deny"
+needless_continue = "deny"
+no_mangle_with_rust_abi = "deny"
+dbg_macro = "deny"
