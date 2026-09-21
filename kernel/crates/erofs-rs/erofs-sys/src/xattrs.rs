@@ -170,6 +170,9 @@ impl<'a> XAttrEntriesProvider for SkippableContinuousIter<'a> {
             let if_index: usize = header.name_index.into();
             if let Some(infix) = ifs.get(if_index) {
                 let pf_index = infix.prefix_index();
+                if pf_index as usize >= EROFS_XATTRS_PREFIXS.len() {
+                    return Err(ENODATA);
+                }
                 let prefix = EROFS_XATTRS_PREFIXS[pf_index as usize];
                 let plen = prefix.len();
 
@@ -182,6 +185,9 @@ impl<'a> XAttrEntriesProvider for SkippableContinuousIter<'a> {
             }
         } else {
             let pf_index: usize = header.name_index.into();
+            if pf_index >= EROFS_XATTRS_PREFIXS.len() {
+                return Err(ENODATA);
+            }
             let prefix = EROFS_XATTRS_PREFIXS[pf_index];
             let plen = prefix.len();
             buffer[..plen].copy_from_slice(&prefix[..plen]);

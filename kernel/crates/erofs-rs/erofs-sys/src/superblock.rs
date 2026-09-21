@@ -32,7 +32,7 @@ pub struct SuperBlock {
     pub(crate) blkszbits: u8,
     pub(crate) sb_extslots: u8,
     /// root_nid
-    pub root_nid: i16,
+    pub root_nid: u16,
     pub(crate) inos: i64,
     /// build_time
     pub build_time: i64,
@@ -70,7 +70,7 @@ impl From<[u8; 128]> for SuperBlock {
             feature_compat: i32::from_le_bytes([value[8], value[9], value[10], value[11]]),
             blkszbits: value[12],
             sb_extslots: value[13],
-            root_nid: i16::from_le_bytes([value[14], value[15]]),
+            root_nid: u16::from_le_bytes([value[14], value[15]]),
             inos: i64::from_le_bytes([
                 value[16], value[17], value[18], value[19], value[20], value[21], value[22],
                 value[23],
@@ -146,16 +146,20 @@ impl SuperBlock {
 
     /// blk_round_up
     pub fn blk_round_up(&self, addr: Off) -> Blk {
-        ((addr + self.blksz() - 1) >> self.blkszbits) as Blk
+        // 饱和计算：恶意 `addr`（如 u64::MAX）必须得到很大的块数，
+        // 绝不能回绕为 0 使 `flatmap` 误判为“全 inline”导致无界读。
+        let blocks = addr.saturating_add(self.blksz() - 1) >> self.blkszbits;
+        blocks.min(Blk::MAX as Off) as Blk
     }
 
     /// generic round up
     pub fn blk_round_up_generic(&self, size: Off) -> Blk {
-        ((size + self.blksz() - 1) >> 9) as Blk
+        let blocks = size.saturating_add(self.blksz() - 1) >> 9;
+        blocks.min(Blk::MAX as Off) as Blk
     }
 
     pub(crate) fn iloc(&self, nid: Nid) -> Off {
-        self.blkpos(self.meta_blkaddr) + ((nid as Off) << (5 as Off))
+        self.blkpos(self.meta_blkaddr).saturating_add(nid.saturating_mul(32))
     }
 
     pub(crate) fn chunk_access(&self, format: ChunkFormat, address: Off) -> Accessor {
@@ -430,6 +434,14 @@ where
 
         let header: XAttrSharedEntrySummary = XAttrSharedEntrySummary::from(buf);
         offset += size_of::<XAttrSharedEntrySummary>() as Off;
+
+        // 共享索引（每个 4 字节）必须落在 inode 的 xattr ibody 区域内，
+        // 否则会越过 summary 头读入相邻元数据/设备外。
+        let max_shared = (info.xattr_size() - size_of::<XAttrSharedEntrySummary>() as Off) / 4;
+        if header.shared_count as Off > max_shared {
+            return Err(EUCLEAN);
+        }
+
         for buf in self.continuous_iter(offset, (header.shared_count << 2) as Off)? {
             let data = buf?;
             extend_from_slice(&mut indexes, unsafe {

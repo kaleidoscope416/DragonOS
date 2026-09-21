@@ -156,9 +156,12 @@ impl IndexNode for ErofsInode {
     fn metadata(&self) -> Result<Metadata, SystemError> {
         let file_type = erofs_type_to_file_type(self.info.inode_type());
         let mode = InodeMode::from_bits_truncate(self.info.mode() as u32);
-        let size = self.info.file_size() as i64;
+        let file_size = self.info.file_size();
+        // 夹紧到 i64 范围：恶意 i_size（>= 2^63）不得让 `size` 变负或使
+        // `blocks` 的加法溢出。
+        let size = file_size.min(i64::MAX as u64) as i64;
         let blk_size: usize = 512;
-        let blocks = ((size as u64 + 511) / 512) as usize;
+        let blocks = file_size.div_ceil(512) as usize;
 
         let (atime, mtime, ctime) = match self.info {
             InodeInfo::Extended(ext) => {

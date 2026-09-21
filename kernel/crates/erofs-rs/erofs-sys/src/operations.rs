@@ -112,6 +112,11 @@ pub(crate) fn get_xattr_infixes<'a>(
         while cur + 2 <= len {
             let mut infix: Vec<u8> = Vec::new();
             let size = u16::from_le_bytes([buf[cur], buf[cur + 1]]) as usize;
+            // infix 至少要有 1 字节的 prefix index；空 infix 会在
+            // `XAttrInfix::prefix_index()`/`name()` 处越界 panic。
+            if size == 0 {
+                return Err(EUCLEAN);
+            }
             let end = cur + 2 + size;
             if end > len {
                 return Err(EUCLEAN);

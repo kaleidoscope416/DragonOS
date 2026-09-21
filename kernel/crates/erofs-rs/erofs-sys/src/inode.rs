@@ -457,8 +457,8 @@ where
         f.backend().fill(&mut buf[0..32], 0, offset)?;
         let compact_buf: CompactInodeInfoBuf = buf[0..32].try_into().unwrap();
         let r: Result<CompactInodeInfo, InodeError> = CompactInodeInfo::try_from(compact_buf);
-        match r {
-            Ok(compact) => Ok(InodeInfo::Compact(compact)),
+        let info = match r {
+            Ok(compact) => InodeInfo::Compact(compact),
             Err(e) => match e {
                 InodeError::VersionError => {
                     let gotten = (sb.blksz() - accessor.off + 32).min(64);
@@ -475,7 +475,7 @@ where
                             sb.blkpos(sb.blknr(offset) + 1),
                         )?;
                     }
-                    Ok(InodeInfo::Extended(ExtendedInodeInfo {
+                    InodeInfo::Extended(ExtendedInodeInfo {
                         i_format: Format(u16::from_le_bytes([buf[0], buf[1]])),
                         i_xattr_icount: u16::from_le_bytes([buf[2], buf[3]]),
                         i_mode: u16::from_le_bytes([buf[4], buf[5]]),
@@ -493,11 +493,20 @@ where
                         i_mtime_nsec: u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
                         i_nlink: u32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
                         i_reserved2: buf[48..64].try_into().unwrap(),
-                    }))
+                    })
                 }
-                InodeError::PosixError(e) => Err(e),
+                InodeError::PosixError(e) => return Err(e),
             },
+        };
+
+        // 拒绝逻辑大小无法落在设备内的 inode：恶意 i_size（如 u64::MAX）
+        // 会使 `blk_round_up`/`flatmap` 溢出并让 readdir 无界迭代整个设备
+        // （DoS）。
+        if sb.blocks() <= 0 || info.file_size() > sb.blocks() as Off * sb.blksz() {
+            return Err(Errno::EUCLEAN);
         }
+
+        Ok(info)
     }
 }
 

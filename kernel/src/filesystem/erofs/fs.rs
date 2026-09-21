@@ -169,6 +169,13 @@ impl ErofsFileSystem {
 }
 
 impl FileSystem for ErofsFileSystem {
+    /// EROFS 只读：无脏页写回，返回 `None`。
+    fn page_cache_writeback_domain(
+        &self,
+    ) -> Option<&Arc<crate::filesystem::page_cache::PageCacheWritebackDomain>> {
+        None
+    }
+
     fn root_inode(&self) -> Arc<dyn IndexNode> {
         self.root_inode.clone()
     }
