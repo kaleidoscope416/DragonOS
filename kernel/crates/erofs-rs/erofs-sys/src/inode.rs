@@ -502,7 +502,15 @@ where
         // 拒绝逻辑大小无法落在设备内的 inode：恶意 i_size（如 u64::MAX）
         // 会使 `blk_round_up`/`flatmap` 溢出并让 readdir 无界迭代整个设备
         // （DoS）。
-        if sb.blocks() <= 0 || info.file_size() > sb.blocks() as Off * sb.blksz() {
+        //
+        // 压缩 inode 例外：解压后的逻辑大小本来就可以（且通常）大于镜像
+        // 大小，其上界由逐 extent 的校验（`PCLUSTER_MAX_DSIZE`、索引区
+        // `lcn >= totalidx`、后端读取越界即报错）保证。
+        let compressed = matches!(
+            info.format().layout(),
+            Layout::CompressedFull | Layout::CompressedCompact
+        );
+        if sb.blocks() <= 0 || (!compressed && info.file_size() > sb.blocks() as Off * sb.blksz()) {
             return Err(Errno::EUCLEAN);
         }
 

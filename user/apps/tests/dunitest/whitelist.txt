@@ -139,3 +139,4 @@ normal/internal_shmem
 normal/proc_task_status
 normal/proc_stat_sched_fields
 normal/erofs_basic
+normal/erofs_lz4

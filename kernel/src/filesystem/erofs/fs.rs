@@ -40,24 +40,38 @@ struct ErofsSuperProbe {
     magic: u32,
     /// `blkszbits`：块大小 = `1 << blkszbits`。Linux 要求 9..=PAGE_SHIFT。
     blkszbits: u8,
-    /// `available_compr_algs`：非 0 表示镜像带压缩（阶段一不支持）。
+    /// `sb.u1` 联合体（超级块偏移 84 的 u16），含义由 `feature_incompat`
+    /// 的 `COMPR_CFGS` 位决定：
+    /// - 置位：`available_compr_algs` 算法位图；
+    /// - 未置位：老式 LZ4-only 镜像的 `lz4_max_distance`（典型 65535）。
     compression: i16,
-    /// `extra_devices`：非 0 表示多设备镜像（阶段一不支持）。
+    /// `extra_devices`：非 0 表示多设备镜像（不支持）。
     extra_devices: i16,
-    /// `feature_incompat`：阶段一仅接受 ZERO_PADDING（0x1，纯信息位），
-    /// 其余（ZSTD/设备表/大 pcluster/chunk/去重等）一律拒绝。
+    /// `feature_incompat`：仅接受 ZERO_PADDING(0x1) 与
+    /// COMPR_CFGS/BIG_PCLUSTER(0x2) 及其组合。
     feature_incompat: u32,
 }
 
-/// EROFS `feature_incompat` 中阶段一唯一接受的位：镜像尾部零填充，不影响读取语义。
+/// EROFS `feature_incompat` 中已支持的位：镜像尾部零填充，不影响读取语义。
 const EROFS_FEATURE_INCOMPAT_ZERO_PADDING: u32 = 0x1;
+
+/// EROFS `feature_incompat` 中已支持的位：超级块携带压缩配置记录
+/// （`Z_EROFS_FEATURE_INCOMPAT_COMPR_CFGS`，同时表示 big pcluster 可用）。
+const EROFS_FEATURE_INCOMPAT_COMPR_CFGS: u32 = 0x2;
+
+/// `Z_EROFS_COMPRESSION_LZ4`（`available_compr_algs` 的 bit 0）。
+const EROFS_COMPR_ALG_LZ4: u16 = 1 << 0;
+
+/// `Z_EROFS_COMPRESSION_LZMA` / `Z_EROFS_COMPRESSION_DEFLATE` 位。
+const EROFS_COMPR_ALG_UNSUPPORTED: u16 = (1 << 1) | (1 << 2);
 
 /// EROFS 最小合法块大小（512B，`blkszbits == 9`）。
 const EROFS_MIN_BLKSZBITS: u8 = 9;
 
 /// 读取并解析 superblock 关键字段。erofs-sys 的 `try_new` 不做 magic /
-/// 压缩 / 多设备 / 块大小校验，缺失时坏镜像会在读路径触发 panic、
-/// 读错数据或 OOB，因此必须在挂载时明确拒绝。
+/// 多设备 / 块大小校验，缺失时坏镜像会在读路径触发 panic、读错数据或 OOB，
+/// 因此必须在挂载时明确拒绝；压缩算法位图与 `feature_incompat` 也在这里把关，
+/// 只放行本实现支持的部分（LZ4 + ZERO_PADDING/COMPR_CFGS）。
 fn probe_erofs_superblock(backend: &BlockDevBackend) -> Result<ErofsSuperProbe, SystemError> {
     let mut sb = [0u8; 128];
     let n = backend
@@ -272,7 +286,7 @@ impl MountableFileSystem for ErofsFileSystem {
         let source = BlockDevSource::new(blk_dev.clone());
         let backend = BlockDevBackend(UncompressedBackend::new(source));
 
-        // 格式预检：非 EROFS / 压缩 / 多设备 / 非法块大小 / 不支持的
+        // 格式预检：非 EROFS / 多设备 / 非法块大小 / 不支持的压缩算法与
         // feature_incompat 位一律拒绝，避免读路径 panic 或读错数据。
         let probe = probe_erofs_superblock(&backend)?;
         if probe.magic != EROFS_MAGIC_V1 {
@@ -291,23 +305,45 @@ impl MountableFileSystem for ErofsFileSystem {
             return Err(SystemError::EUCLEAN);
         }
         if probe.compression != 0 {
-            log::warn!(
-                "erofs: compressed image (available_compr_algs={}) on {} not supported in phase 1",
-                probe.compression, md.source
-            );
-            return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+            // `sb.u1` 的含义取决于 COMPR_CFGS：
+            //  - 置位：`available_compr_algs` 位图，必须含 LZ4 且不含 LZMA/DEFLATE；
+            //  - 未置位：老式镜像的 `lz4_max_distance`（典型 65535），不能按位图校验。
+            if probe.feature_incompat & EROFS_FEATURE_INCOMPAT_COMPR_CFGS != 0 {
+                let algs = probe.compression as u16;
+                if algs & !(EROFS_COMPR_ALG_LZ4 | EROFS_COMPR_ALG_UNSUPPORTED) != 0 {
+                    log::warn!(
+                        "erofs: unknown compressed algorithms {:#x} on {}",
+                        algs,
+                        md.source
+                    );
+                    return Err(SystemError::EUCLEAN);
+                }
+                if algs & EROFS_COMPR_ALG_UNSUPPORTED != 0 || algs & EROFS_COMPR_ALG_LZ4 == 0 {
+                    log::warn!(
+                        "erofs: compressed image without LZ4 (available_compr_algs={:#x}) on {}",
+                        algs,
+                        md.source
+                    );
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+            }
         }
         if probe.extra_devices != 0 {
             log::warn!(
-                "erofs: multi-device image (extra_devices={}) on {} not supported in phase 1",
-                probe.extra_devices, md.source
+                "erofs: multi-device image (extra_devices={}) on {}",
+                probe.extra_devices,
+                md.source
             );
             return Err(SystemError::EUCLEAN);
         }
-        if probe.feature_incompat & !EROFS_FEATURE_INCOMPAT_ZERO_PADDING != 0 {
+        if probe.feature_incompat
+            & !(EROFS_FEATURE_INCOMPAT_ZERO_PADDING | EROFS_FEATURE_INCOMPAT_COMPR_CFGS)
+            != 0
+        {
             log::warn!(
-                "erofs: unsupported feature_incompat {:#x} on {} (phase 1)",
-                probe.feature_incompat, md.source
+                "erofs: unsupported feature_incompat {:#x} on {}",
+                probe.feature_incompat,
+                md.source
             );
             return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
         }

@@ -159,7 +159,8 @@ impl SuperBlock {
     }
 
     pub(crate) fn iloc(&self, nid: Nid) -> Off {
-        self.blkpos(self.meta_blkaddr).saturating_add(nid.saturating_mul(32))
+        self.blkpos(self.meta_blkaddr)
+            .saturating_add(nid.saturating_mul(32))
     }
 
     pub(crate) fn chunk_access(&self, format: ChunkFormat, address: Off) -> Accessor {
@@ -175,7 +176,7 @@ impl SuperBlock {
     pub fn inos(&self) -> i64 {
         self.inos
     }
- }
+}
 
 /// FileSystem trait
 pub trait FileSystem<I>
@@ -201,7 +202,11 @@ where
             _ => Err(EUCLEAN),
         }?;
 
-        let lastblk = if inline { nblocks.saturating_sub(1) } else { nblocks };
+        let lastblk = if inline {
+            nblocks.saturating_sub(1)
+        } else {
+            nblocks
+        };
         // Skip normal data-block path when all data is inlined (FLAT_INLINE + NULL addr)
         let all_inline = inline && (blkaddr == u32::MAX || nblocks <= 1);
         if !all_inline && offset < sb.blkpos(lastblk) {
@@ -215,6 +220,7 @@ where
                 algorithm_format: 0,
                 device_id: 0,
                 map_type: MapType::Normal,
+                algorithm: Algorithm::None,
             })
         } else if inline {
             let len = inode.info().file_size() - offset;
@@ -231,6 +237,7 @@ where
                 algorithm_format: 0,
                 device_id: 0,
                 map_type: MapType::Meta,
+                algorithm: Algorithm::None,
             })
         } else {
             Err(EUCLEAN)
@@ -273,6 +280,7 @@ where
                     algorithm_format: 0,
                     device_id: chunk_index.device_id & self.device_info().mask,
                     map_type: MapType::Normal,
+                    algorithm: Algorithm::None,
                 })
             }
         } else {
@@ -304,6 +312,7 @@ where
                     algorithm_format: 0,
                     device_id: 0,
                     map_type: MapType::Normal,
+                    algorithm: Algorithm::None,
                 })
             }
         }
@@ -315,7 +324,10 @@ where
             Layout::FlatInline => self.flatmap(inode, offset, true),
             Layout::FlatPlain => self.flatmap(inode, offset, false),
             Layout::Chunk => self.chunk_map(inode, offset),
-            _ => todo!(),
+            Layout::CompressedFull | Layout::CompressedCompact => {
+                zmap::map_blocks(self, inode, offset)
+            }
+            Layout::Unknown => Err(EOPNOTSUPP),
         }
     }
 
@@ -656,9 +668,49 @@ pub(crate) mod tests {
         flat.chain(chunk)
     }
 
+    /// LZ4 压缩夹具（同一份源数据，三种镜像布局）：
+    /// - `sample_lz4.img`：`-zlz4hc,9 -C65536`（COMPACT 索引 + big pcluster/CBLKCNT + 0padding）；
+    /// - `sample_lz4_small.img`：`-zlz4hc,9 -C4096`（COMPACT 索引 + 单块 pcluster + 0padding）；
+    /// - `sample_lz4_legacy.img`：`-zlz4 -Elegacy-compress`（FULL 索引 + 无 0padding + literal 段）。
+    ///
+    /// 重生成方式（erofs-utils 1.4+）：
+    ///
+    /// ```sh
+    /// cd kernel/crates/erofs-rs/erofs-sys
+    /// rm -rf /tmp/lz4root && mkdir -p /tmp/lz4root/sub
+    /// python3 -c 'import sys; sys.stdout.buffer.write(b"DragonOS-EROFS-LZ4-fixture-pattern-0123456789\n" * 4096)' > /tmp/lz4root/compressible.bin
+    /// python3 -c 'import sys; r=0x12345678; sys.stdout.buffer.write(bytes(((r:=r*1103515245+12345)&0xffff)>>8 for _ in range(32768)))' > /tmp/lz4root/random.bin
+    /// python3 -c 'import sys; p=b"DragonOS-EROFS-LZ4-fixture-pattern-0123456789\n"; r=0x12345678; sys.stdout.buffer.write(p*2226 + bytes(((r:=r*1103515245+12345)&0xffff)>>8 for _ in range(32768)))' > /tmp/lz4root/mixed.bin
+    /// printf 'hello lz4 erofs\n' > /tmp/lz4root/sub/hello.txt
+    /// mkfs.erofs -zlz4hc,9 -C65536 tests/sample_lz4.img /tmp/lz4root
+    /// mkfs.erofs -zlz4hc,9 -C4096 tests/sample_lz4_small.img /tmp/lz4root
+    /// mkfs.erofs -zlz4 -Elegacy-compress tests/sample_lz4_legacy.img /tmp/lz4root
+    /// ```
+    pub(crate) fn load_fixtures_lz4() -> impl Iterator<Item = TestFile> {
+        [
+            "sample_lz4.img",
+            "sample_lz4_small.img",
+            "sample_lz4_legacy.img",
+        ]
+        .into_iter()
+        .map(|name| {
+            let mut s = env!("CARGO_MANIFEST_DIR").to_string();
+            s.push_str("/tests/");
+            s.push_str(name);
+            TestFile {
+                file: File::options()
+                    .read(true)
+                    .write(true)
+                    .open(Path::new(&s))
+                    .unwrap(),
+                xattrs: false,
+            }
+        })
+    }
+
     pub(crate) fn load_fixtures_noxattr() -> impl Iterator<Item = TestFile> {
         let mut s = env!("CARGO_MANIFEST_DIR").to_string();
-        s.push_str(&"/tests/sample_noxattrs.img".to_string());
+        s.push_str("/tests/sample_noxattrs.img");
         return [TestFile {
             file: File::options()
                 .read(true)
@@ -847,6 +899,93 @@ pub(crate) mod tests {
             .filesystem
             .get_xattr(inode, 2, b"", &mut None)
             .is_err_and(|x| x == Errno::ENODATA));
+    }
+
+    /// 从 `offset` 起按映射迭代器读取整个文件内容。
+    fn read_file(sbi: &mut SimpleBufferedFileSystem, path: &str, offset: Off) -> vec::Vec<u8> {
+        let inode = lookup(
+            &*sbi.filesystem,
+            &mut sbi.inodes,
+            sbi.filesystem.superblock().root_nid as Nid,
+            path,
+        )
+        .unwrap();
+        let mut out = vec::Vec::new();
+        for block in sbi.filesystem.mapped_iter(inode, offset).unwrap() {
+            out.extend_from_slice(block.unwrap().content());
+        }
+        out
+    }
+
+    fn sha512_of(data: &[u8]) -> [u8; 64] {
+        let mut hasher = Sha512::new();
+        hasher.update(data);
+        hasher.finalize().into()
+    }
+
+    /// LZ4 压缩镜像的读取断言：整体读取、非块对齐偏移读取、
+    /// 压缩（含 big pcluster / literal 段）、未压缩与内联文件。
+    pub(crate) fn test_lz4_filesystem(sbi: &mut SimpleBufferedFileSystem) {
+        // 高压缩比文件：COMPACT 索引的 NONHEAD 链 + 多次按需增长解码。
+        const COMPRESSIBLE: [u8; 64] = hex!("4a903fb5a1e405cf7630584bdf5143f78a30019cd97698ca1898a52fa2a60ec14fc484cad6842ae4f0e6f6d086a8f718c3053d4d38cdec3c883cf373a135f9ba");
+        const MIXED: [u8; 64] = hex!("ec9b032f9ca9ad88013bbf85af3e7babdbff2f9d4cec4c17c96d2ca5afc0df79c7b8479d5341c8b84529c4377c2552b01f6223ed6ae826580c71d831674f939c");
+        const RANDOM: [u8; 64] = hex!("feff1ad341728f781690f172a74f90d6e3ee4decd02991c2cc53a45ff588eb511ed58b23f921552526d59eeaf1d9499287732da348cbed4a33ef5204bd182684");
+        const HELLO: [u8; 64] = hex!("0e8e0f949db052b6ae0d3ed2441ee45b9b6c2bbeec65c8ccd23a87eef18f096813858a569acf1e1bee3edb2c04838b189413c6813e570a41036223d88a483b3c");
+
+        let compressible = read_file(sbi, "/compressible.bin", 0);
+        assert_eq!(compressible.len(), 188416);
+        assert_eq!(sha512_of(&compressible), COMPRESSIBLE);
+
+        // 从块中段（且非块对齐）开始读取：首块必须从请求偏移开始。
+        const MID: Off = 4096 * 3 + 17;
+        let tail = read_file(sbi, "/compressible.bin", MID);
+        assert_eq!(tail, compressible[MID as usize..]);
+
+        // mixed.bin 含 big pcluster（CBLKCNT）与末尾的 literal（SHIFTED）段。
+        let mixed = read_file(sbi, "/mixed.bin", 0);
+        assert_eq!(mixed.len(), 135164);
+        assert_eq!(sha512_of(&mixed), MIXED);
+        // 16.5 个块之后（跨 extent 边界）继续读。
+        let mixed_tail = read_file(sbi, "/mixed.bin", 4096 * 16 + 1234);
+        assert_eq!(mixed_tail, mixed[4096 * 16 + 1234..]);
+
+        let random = read_file(sbi, "/random.bin", 0);
+        assert_eq!(random.len(), 32768);
+        assert_eq!(sha512_of(&random), RANDOM);
+
+        let hello = read_file(sbi, "/sub/hello.txt", 0);
+        assert_eq!(hello, b"hello lz4 erofs\n");
+        assert_eq!(sha512_of(&hello), HELLO);
+
+        // 目录遍历仍可用（未压缩目录）。
+        let root = lookup(
+            &*sbi.filesystem,
+            &mut sbi.inodes,
+            sbi.filesystem.superblock().root_nid as Nid,
+            "/",
+        )
+        .unwrap();
+        let mut names = vec::Vec::new();
+        sbi.filesystem
+            .fill_dentries(root, 0, 0, &mut |dirent, _pos| {
+                names.push(std::string::String::from(
+                    core::str::from_utf8(dirent.dirname()).unwrap(),
+                ));
+                false
+            })
+            .unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ".",
+                "..",
+                "compressible.bin",
+                "mixed.bin",
+                "random.bin",
+                "sub"
+            ]
+        );
     }
 
     pub(crate) fn test_filesystem(sbi: &mut SimpleBufferedFileSystem, xattrs_enabled: bool) {

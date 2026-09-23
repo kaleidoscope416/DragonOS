@@ -1,6 +1,7 @@
 // Copyright 2024 Yiyang Wu
 // SPDX-License-Identifier: MIT or GPL-2.0-or-later
 
+use super::compression::{load_compr_cfgs, CompressionInfo};
 use super::data::raw_iters::temp_iter::*;
 use super::operations::*;
 use super::*;
@@ -14,6 +15,8 @@ where
     infixes: Vec<XAttrInfix>,
     sb: SuperBlock,
     device_info: DeviceInfo,
+    /// 超级块级压缩配置（未启用压缩时为 `None`）。
+    compr: Option<CompressionInfo>,
 }
 
 impl<I, B> FileSystem<I> for ImageFileSystem<B>
@@ -36,7 +39,9 @@ where
         heap_alloc(TempBufferMapIter::new(
             &self.sb,
             &self.backend,
+            self.compr.as_ref(),
             MapIter::new(self, inode, offset),
+            offset,
         ))
         .map(|v| v as Box<dyn BufferMapIter<'a> + 'b>)
     }
@@ -85,11 +90,13 @@ where
             sb.devt_slotoff as Off * 128,
             sb.extra_devices as Off * 128,
         ))?;
+        let compr = load_compr_cfgs(&backend, &sb)?;
         Ok(Self {
             backend,
             sb,
             infixes,
             device_info,
+            compr,
         })
     }
 }
@@ -115,6 +122,20 @@ mod tests {
     }
 
     impl FileSource for File {}
+
+    #[test]
+    fn test_lz4_img_filesystem() {
+        for testcase in load_fixtures_lz4() {
+            let mut sbi: SimpleBufferedFileSystem = SuperblockInfo::new(
+                Box::new(
+                    ImageFileSystem::try_new(UncompressedBackend::new(testcase.file)).unwrap(),
+                ),
+                HashMap::new(),
+                (),
+            );
+            test_lz4_filesystem(&mut sbi);
+        }
+    }
 
     #[test]
     fn test_uncompressed_img_filesystem() {

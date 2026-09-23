@@ -41,6 +41,7 @@ pub mod xattrs;
 pub use errnos::Errno;
 /// Documentation
 pub type PosixResult<T> = Result<T, errnos::Errno>;
+pub(crate) mod zmap;
 
 /// Helper macro to round up or down a number.
 #[macro_export]

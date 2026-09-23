@@ -1,6 +1,7 @@
 // Copyright 2024 Yiyang Wu
 // SPDX-License-Identifier: MIT or GPL-2.0-or-later
 
+use super::compression::{load_compr_cfgs, CompressionInfo};
 use super::data::raw_iters::ref_iter::*;
 use super::operations::*;
 use super::*;
@@ -18,6 +19,8 @@ where
     sb: SuperBlock,
     infixes: Vec<XAttrInfix>,
     device_info: DeviceInfo,
+    /// 超级块级压缩配置（未启用压缩时为 `None`）。
+    compr: Option<CompressionInfo>,
 }
 
 impl<I, T> FileSystem<I> for MemFileSystem<T>
@@ -44,7 +47,9 @@ where
         heap_alloc(RefMapIter::new(
             &self.sb,
             &self.backend,
+            self.compr.as_ref(),
             MapIter::new(self, inode, offset),
+            offset,
         ))
         .map(|v| v as Box<dyn BufferMapIter<'a> + 'b>)
     }
@@ -85,11 +90,13 @@ where
             sb.devt_slotoff as Off * 128,
             sb.extra_devices as Off * 128,
         ))?;
+        let compr = load_compr_cfgs(&backend, &sb)?;
         Ok(Self {
             backend,
             sb,
             infixes,
             device_info,
+            compr,
         })
     }
 }
@@ -124,6 +131,23 @@ mod tests {
             let rlen = len.min(self.len() as u64 - offset);
             let buf = &self[offset as usize..maxsize.min(offset + rlen) as usize];
             Ok(RefBuffer::new(buf, 0, rlen as usize, |_| {}))
+        }
+    }
+
+    #[test]
+    fn test_lz4_mmap_filesystem() {
+        for testcase in load_fixtures_lz4() {
+            let mut sbi: SimpleBufferedFileSystem = SuperblockInfo::new(
+                Box::new(
+                    MemFileSystem::try_new(UncompressedBackend::new(unsafe {
+                        MmapMut::map_mut(&testcase.file).unwrap()
+                    }))
+                    .unwrap(),
+                ),
+                HashMap::new(),
+                (),
+            );
+            test_lz4_filesystem(&mut sbi);
         }
     }
 

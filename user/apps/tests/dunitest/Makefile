@@ -23,7 +23,12 @@ EXT4_FIXTURE = $(BUILD_DIR)/fixtures/ext4_inode_identity.img
 EXT4_UNINIT_FIXTURE = $(BUILD_DIR)/fixtures/ext4_uninit_bitmap.img
 EROFS_FIXTURE = $(BUILD_DIR)/fixtures/erofs_basic.img
 EROFS_FIXTURE_ROOT = $(BUILD_DIR)/fixtures/erofs_root
-# 非法镜像：blkszbits 置 0；feature_incompat 置 ZSTD(0x2)。
+# LZ4 压缩夹具：同一份源数据，三种镜像布局（erofs_lz4 测例参数化覆盖）。
+EROFS_LZ4_ROOT = $(BUILD_DIR)/fixtures/erofs_lz4_root
+EROFS_LZ4_FIXTURE = $(BUILD_DIR)/fixtures/erofs_lz4.img
+EROFS_LZ4_BIG_FIXTURE = $(BUILD_DIR)/fixtures/erofs_lz4_big.img
+EROFS_LZ4_FULL_FIXTURE = $(BUILD_DIR)/fixtures/erofs_lz4_full.img
+# 非法镜像：blkszbits 置 0；feature_incompat 置 ZTAILPACKING(0x10)。
 # 挂载必须被内核拒绝，不能进入读路径。
 EROFS_FIXTURE_BAD_BLKSZ = $(BUILD_DIR)/fixtures/erofs_bad_blkszbits.img
 EROFS_FIXTURE_BAD_INCOMPAT = $(BUILD_DIR)/fixtures/erofs_bad_incompat.img
@@ -66,7 +71,8 @@ $(GTEST_SRC):
 	@test -f "$(GTEST_SRC)"
 
 build-suites: $(TEST_BINS) $(EXT4_FIXTURE) $(EXT4_UNINIT_FIXTURE) $(EROFS_FIXTURE) \
-	$(EROFS_FIXTURE_BAD_BLKSZ) $(EROFS_FIXTURE_BAD_INCOMPAT)
+	$(EROFS_FIXTURE_BAD_BLKSZ) $(EROFS_FIXTURE_BAD_INCOMPAT) \
+	$(EROFS_LZ4_FIXTURE) $(EROFS_LZ4_BIG_FIXTURE) $(EROFS_LZ4_FULL_FIXTURE)
 
 $(EXT4_FIXTURE):
 	@mkdir -p "$(dir $@)"
@@ -116,12 +122,43 @@ $(EROFS_FIXTURE_BAD_BLKSZ): $(EROFS_FIXTURE)
 	@cp "$<" "$@"
 	@printf '\000' | dd of="$@" bs=1 seek=1036 conv=notrunc status=none
 
-# feature_incompat 位于 superblock 偏移 80..84 → 文件偏移 1104，置 ZSTD(0x2)。
+# feature_incompat 位于 superblock 偏移 80..84 → 文件偏移 1104，置 ZTAILPACKING(0x10)。
 $(EROFS_FIXTURE_BAD_INCOMPAT): $(EROFS_FIXTURE)
 	@mkdir -p "$(dir $@)"
 	@cp "$<" "$@"
-	@printf '\002\000\000\000' | dd of="$@" bs=1 seek=1104 conv=notrunc status=none
+	@printf '\020\000\000\000' | dd of="$@" bs=1 seek=1104 conv=notrunc status=none
 
+
+# LZ4 压缩夹具根目录：内容必须与 suites/normal/erofs_lz4.cc 的期望公式一致。
+#  - compressible.bin：46 字节可压缩模式重复 4096 次（188416 字节，高压缩比）；
+#  - mixed.bin：可压缩模式重复 2226 次（102396 字节）+ 32768 字节 LCG 伪随机
+#    （触发 LZ4 extent 与末尾 literal/SHIFTED 段）；
+#  - incompressible.bin：32768 字节 LCG 伪随机（整体不压缩 → FLAT 布局）。
+$(EROFS_LZ4_ROOT):
+	@mkdir -p "$@" "$@/subdir"
+	@python3 -c 'import sys; sys.stdout.buffer.write(b"DragonOS-EROFS-LZ4-fixture-pattern-0123456789\n" * 4096)' > "$@/compressible.bin"
+	@python3 -c 'import sys; p=b"DragonOS-EROFS-LZ4-fixture-pattern-0123456789\n"; r=0x12345678; sys.stdout.buffer.write(p*2226 + bytes(((r:=r*1103515245+12345)&0xffff)>>8 for _ in range(32768)))' > "$@/mixed.bin"
+	@python3 -c 'import sys; r=0x12345678; sys.stdout.buffer.write(bytes(((r:=r*1103515245+12345)&0xffff)>>8 for _ in range(32768)))' > "$@/incompressible.bin"
+	@printf 'hello lz4 erofs\n' > "$@/small.txt"
+	@printf 'nested lz4 content\n' > "$@/subdir/nested.txt"
+	@printf 'lz4 symlink target\n' > "$@/target.txt"
+	@ln -sf target.txt "$@/symlink"
+
+# 三种镜像布局：
+#  - erofs_lz4.img：COMPACT 索引 + 单块 pcluster（feature_incompat = ZERO_PADDING）；
+#  - erofs_lz4_big.img：COMPACT 索引 + big pcluster/CBLKCNT（feature_incompat = 0x3）；
+#  - erofs_lz4_full.img：FULL 索引 + 无 0padding（feature_incompat = 0x0）。
+$(EROFS_LZ4_FIXTURE): $(EROFS_LZ4_ROOT)
+	@mkdir -p "$(dir $@)"
+	@mkfs.erofs -zlz4hc,9 -C4096 "$@" "$(EROFS_LZ4_ROOT)" 2>/dev/null || { echo "错误: mkfs.erofs 不可用或不支持 -zlz4hc/-C（需要 erofs-utils 1.4+）" >&2; exit 1; }
+
+$(EROFS_LZ4_BIG_FIXTURE): $(EROFS_LZ4_ROOT)
+	@mkdir -p "$(dir $@)"
+	@mkfs.erofs -zlz4hc,9 -C65536 "$@" "$(EROFS_LZ4_ROOT)" 2>/dev/null || { echo "错误: mkfs.erofs 不可用或不支持 -zlz4hc/-C（需要 erofs-utils 1.4+）" >&2; exit 1; }
+
+$(EROFS_LZ4_FULL_FIXTURE): $(EROFS_LZ4_ROOT)
+	@mkdir -p "$(dir $@)"
+	@mkfs.erofs -zlz4 -Elegacy-compress "$@" "$(EROFS_LZ4_ROOT)" 2>/dev/null || { echo "错误: mkfs.erofs 不可用或不支持 -Elegacy-compress（需要 erofs-utils 1.4+）" >&2; exit 1; }
 
 $(GTEST_OBJ): $(GTEST_SRC)
 	@mkdir -p "$(dir $@)"
@@ -153,6 +190,9 @@ install: build
 	@cp -f $(EROFS_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f $(EROFS_FIXTURE_BAD_BLKSZ) $(INSTALL_DIR)/fixtures/
 	@cp -f $(EROFS_FIXTURE_BAD_INCOMPAT) $(INSTALL_DIR)/fixtures/
+	@cp -f $(EROFS_LZ4_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp -f $(EROFS_LZ4_BIG_FIXTURE) $(INSTALL_DIR)/fixtures/
+	@cp -f $(EROFS_LZ4_FULL_FIXTURE) $(INSTALL_DIR)/fixtures/
 	@cp -f whitelist.txt $(INSTALL_DIR)/whitelist.txt
 	@cp -f no_skip.txt $(INSTALL_DIR)/no_skip.txt
 	@cp -f scripts/run_tests.sh $(INSTALL_DIR)/run_tests.sh
