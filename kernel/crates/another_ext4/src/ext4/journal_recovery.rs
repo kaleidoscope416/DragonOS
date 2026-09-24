@@ -292,11 +292,16 @@ fn parse_tags(block: &[u8], sb: &Superblock, target_blocks: u64) -> Result<Vec<T
         };
         off += size;
         if flags & FLAG_SAME_UUID == 0 {
-            let uuid = block.get(off..off + 16).ok_or_else(eio)?;
-            if uuid != sb.uuid {
+            // Linux writes `journal->j_uuid` into this slot for the first tag of
+            // a descriptor block, but that field is never initialized for an
+            // internal ext4 journal, so the on-disk bytes are zero-filled.
+            // Recovery (`do_one_pass()`/`count_tags()`) only skips the 16 bytes
+            // and never validates them, so a strict comparison against the
+            // journal superblock UUID rejects every Linux-written journal.
+            off = off.checked_add(16).ok_or_else(eio)?;
+            if off > end {
                 return Err(Ext4Error::new(ErrCode::EIO));
             }
-            off += 16;
         }
         let target = low | (high << 32);
         if target >= target_blocks {
@@ -423,12 +428,15 @@ mod tests {
         b
     }
     fn descriptor(seq: u32, target: u32, escape: bool) -> Vec<u8> {
+        descriptor_with_uuid(seq, target, escape, [0x5a; 16])
+    }
+    fn descriptor_with_uuid(seq: u32, target: u32, escape: bool, uuid: [u8; 16]) -> Vec<u8> {
         let mut b = vec![0; 1024];
         hdr(&mut b, BlockType::Descriptor, seq);
         put(&mut b, 12, target);
         let flags = FLAG_LAST_TAG | if escape { FLAG_ESCAPE } else { 0 };
         b[18..20].copy_from_slice(&(flags as u16).to_be_bytes());
-        b[20..36].copy_from_slice(&[0x5a; 16]);
+        b[20..36].copy_from_slice(&uuid);
         b
     }
     fn commit(seq: u32) -> Vec<u8> {
@@ -467,6 +475,22 @@ mod tests {
             &*io.events.borrow(),
             &["home-write", "home-flush", "journal-write", "journal-flush"]
         );
+        assert_eq!(be32(&io.journal.borrow()[0], 28).unwrap(), 0);
+    }
+
+    /// jbd2 leaves the 16-byte slot after a tag without `SAME_UUID` zero-filled:
+    /// `journal->j_uuid` is never initialized for an internal ext4 journal.
+    /// Linux recovery only skips those bytes, so this must still replay.
+    #[test]
+    fn replays_descriptor_with_uninitialized_tag_uuid() {
+        let mut blocks = vec![vec![0; 1024]; 6];
+        blocks[0] = superblock(6, 1, 5);
+        blocks[1] = descriptor_with_uuid(5, 41, false, [0; 16]);
+        blocks[2] = vec![0x44; 1024];
+        blocks[3] = commit(5);
+        let io = memory(blocks);
+        assert_eq!(recover(&io).unwrap().transactions, 1);
+        assert_eq!(&io.home.borrow()[&41][..], &[0x44; 1024][..]);
         assert_eq!(be32(&io.journal.borrow()[0], 28).unwrap(), 0);
     }
 
