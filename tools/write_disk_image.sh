@@ -26,7 +26,7 @@ fi
 ROOTFS_MOUNTED=0
 cleanup() {
     if [ "${ROOTFS_MOUNTED}" = "1" ]; then
-        $DADK "${DADK_MANIFEST_ARGS[@]}" -w "$root_folder" rootfs umount || true
+        umount_rootfs || true
     fi
 }
 kernel="${root_folder}/bin/kernel/kernel.elf"
@@ -57,6 +57,25 @@ fi
 mount_folder=$($DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs show-mountpoint || exit 1)
 boot_folder="${mount_folder}/boot"
 GRUB_INSTALL_PATH="${boot_folder}/grub"
+
+# 释放 rootfs 挂载。dadk 的 `rootfs umount` 在循环设备仍存在时会把 umount 的
+# 失败降级为日志：桌面会话的 gnome-shell-hotplug-sniffer 等进程会短暂打开新
+# 挂载点内的文件，令 umount 返回 EBUSY，于是留下已挂载的镜像，QEMU 启动后
+# 宿主机与 guest 会同时写入该镜像。这里以 findmnt 的实际状态为准重试。
+umount_rootfs() {
+    local attempt
+    for attempt in 1 2 3 4 5 6; do
+        $DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs umount || true
+        if ! findmnt -rn "${mount_folder}" >/dev/null 2>&1; then
+            ROOTFS_MOUNTED=0
+            return 0
+        fi
+        echo "警告: 磁盘镜像仍挂载在 ${mount_folder}（第 ${attempt} 次尝试），等待后重试..." >&2
+        sync
+        sleep 1
+    done
+    return 1
+}
 
 ARGS=`getopt -o p -l bios: -- "$@"`
 eval set -- "${ARGS}"
@@ -395,8 +414,7 @@ fi
 
 if [ "${sysconfig_ok}" != "1" ]; then
     echo "Error: sysconfig payload import/audit failed, deleting the partially updated disk image" >&2
-    $DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs umount || true
-    ROOTFS_MOUNTED=0
+    umount_rootfs || true
     $DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs delete || true
     rm -f "${SYSCONFIG_SCHEMA_STATE}"
     exit 1
@@ -476,8 +494,11 @@ fi
 
 sync
 
-$DADK "${DADK_MANIFEST_ARGS[@]}" -w $root_folder rootfs umount || exit 1
-ROOTFS_MOUNTED=0
+if ! umount_rootfs; then
+    echo "错误: 无法卸载磁盘镜像 ${mount_folder}" >&2
+    echo "错误: 请手动执行 'sudo umount ${mount_folder}' 后重试，否则宿主机与 guest 会同时写入该镜像。" >&2
+    exit 1
+fi
 
 # Record the schema version only after full success, so the next build can
 # decide whether a forced image rebuild is needed.

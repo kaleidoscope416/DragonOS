@@ -67,6 +67,34 @@ check_dependencies()
 }
 
 
+# 宿主机仍挂载着 guest 要使用的磁盘镜像时禁止启动：此时宿主机与 guest 会成为
+# 两个独立的写者，宿主机回写的元数据会破坏 guest 的写入。
+# （dadk 的 `rootfs umount` 在卸载失败但循环设备存在时只记录日志并继续，
+#   会留下已挂载的镜像，因此这里在启动前显式校验。）
+check_disk_image_not_mounted()
+{
+    if ! command -v losetup >/dev/null 2>&1 || ! command -v findmnt >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local image loop_dev dev mount_point
+    image="$(realpath "${QEMU_DISK_IMAGE}" 2>/dev/null || echo "${QEMU_DISK_IMAGE}")"
+
+    while IFS=: read -r loop_dev _; do
+        [ -n "${loop_dev}" ] || continue
+        for dev in "${loop_dev}" "${loop_dev}p1"; do
+            mount_point="$(findmnt -rn -o TARGET -S "${dev}" 2>/dev/null | head -n 1)"
+            if [ -n "${mount_point}" ]; then
+                echo "[错误] 磁盘镜像仍被宿主机挂载: ${dev} -> ${mount_point}"
+                echo "[错误] 请先执行 'sudo umount ${mount_point}' 再启动 QEMU，"
+                echo "[错误] 否则宿主机与 guest 会同时写入该镜像并破坏文件系统。"
+                exit 1
+            fi
+        done
+    done < <(losetup -j "${image}" 2>/dev/null || true)
+}
+
+
 # 进行启动前检查
 flag_can_run=1
 ARGS=`getopt -o p -l bios:,display: -- "$@"`
@@ -476,6 +504,9 @@ fi
 
 
 check_dependencies
+
+# 宿主机挂载着镜像时禁止启动（两个写者会破坏文件系统）
+check_disk_image_not_mounted
 
 # 设置无图形界面模式
 QEMU_NOGRAPHIC=false
